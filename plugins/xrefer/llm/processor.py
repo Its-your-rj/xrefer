@@ -17,16 +17,31 @@ DSPy-native LLM processor with Pydantic validation.
 """
 
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import dspy
 import litellm
 import httpx
+from dspy.adapters.json_adapter import JSONAdapter
 
 from xrefer.core.helpers import check_internet_connectivity, log
 from xrefer.llm.base import ModelConfig, PromptType
 from xrefer.llm.dspy_modules import ArtifactAnalysisResponse, ArtifactAnalyzerModule, CategorizationResponse, CategorizerModule, ClusterAnalysisResponse, ClusterAnalyzerModule
+
+
+class _GeminiJSONAdapter(JSONAdapter):
+    """JSONAdapter that skips the structured-output attempt for Gemini models.
+
+    DSPy normally tries Gemini's native response_schema first.  When that fails
+    (complex Pydantic schemas are not supported), it falls back to plain JSON —
+    making 2 API calls per operation instead of 1 and doubling rate-limit usage.
+    This adapter goes straight to json_object mode, cutting the call count in half.
+    """
+    def _json_adapter_call_common(self, lm, lm_kwargs, signature, demos, inputs, call_fn):
+        lm_kwargs["response_format"] = {"type": "json_object"}
+        return call_fn(lm, lm_kwargs, signature, demos, inputs)
 
 
 @dataclass
@@ -68,7 +83,10 @@ class LLMProcessor:
             lm_kwargs.update({"max_tokens": 65536})
 
         self.lm = dspy.LM(**lm_kwargs)
-        dspy.settings.configure(lm=self.lm)
+        if 'gemini' in config.model_id.lower():
+            dspy.settings.configure(lm=self.lm, adapter=_GeminiJSONAdapter())
+        else:
+            dspy.settings.configure(lm=self.lm)
 
     def validate_api_key(self) -> bool:
         """Validate API key with a test call."""
@@ -97,36 +115,44 @@ class LLMProcessor:
         """
         Process items using DSPy module.
         """
-        try:
-            if prompt_type == PromptType.CATEGORIZER:
-                response: "CategorizationResponse" = CategorizerModule()(items=items, categories=config.categories, item_type=config.item_type)
-                return response.model_dump()
-            elif prompt_type == PromptType.ARTIFACT_ANALYZER:
-                artifacts = self._create_artifacts_dict(items)
-                response: "ArtifactAnalysisResponse" = ArtifactAnalyzerModule()(artifacts=artifacts)
-                return set(response.interesting_indexes)
-            elif prompt_type == PromptType.CLUSTER_ANALYZER:
-                response: "ClusterAnalysisResponse" = ClusterAnalyzerModule()(cluster_data=items[0])
-                return response.model_dump()
-            else:
-                raise ValueError(f"Unsupported prompt type: {prompt_type}")
-        except (litellm.exceptions.RateLimitError, httpx.HTTPStatusError) as e:
-            log(f'''{e.__class__.__name__} was raised during LLM processing:
+        backoff_secs = [15, 30]  # wait times between retries (seconds)
+
+        for attempt in range(len(backoff_secs) + 1):
+            try:
+                if prompt_type == PromptType.CATEGORIZER:
+                    response: "CategorizationResponse" = CategorizerModule()(items=items, categories=config.categories, item_type=config.item_type)
+                    return response.model_dump()
+                elif prompt_type == PromptType.ARTIFACT_ANALYZER:
+                    artifacts = self._create_artifacts_dict(items)
+                    response: "ArtifactAnalysisResponse" = ArtifactAnalyzerModule()(artifacts=artifacts)
+                    return set(response.interesting_indexes)
+                elif prompt_type == PromptType.CLUSTER_ANALYZER:
+                    response: "ClusterAnalysisResponse" = ClusterAnalyzerModule()(cluster_data=items[0])
+                    return response.model_dump()
+                else:
+                    raise ValueError(f"Unsupported prompt type: {prompt_type}")
+            except (litellm.exceptions.RateLimitError, httpx.HTTPStatusError) as e:
+                if attempt < len(backoff_secs):
+                    wait = backoff_secs[attempt]
+                    log(f'[!] RateLimitError - waiting {wait}s before retry ({attempt + 1}/{len(backoff_secs)})...')
+                    time.sleep(wait)
+                    continue
+                log(f'''{e.__class__.__name__} was raised during LLM processing:
 
 You can:
   a. Wait a few minutes and retry
   b. Check API quota/billing
   c. Use a cheaper model
 ''')
-            # Return empty result instead of raising - let caller handle gracefully
-            if prompt_type == PromptType.CATEGORIZER:
-                return {}
-            elif prompt_type == PromptType.ARTIFACT_ANALYZER:
-                return set()
-            elif prompt_type == PromptType.CLUSTER_ANALYZER:
-                return {}
-            else:
-                raise ValueError(f"Unsupported prompt type: {prompt_type}")
+                # Return empty result instead of raising - let caller handle gracefully
+                if prompt_type == PromptType.CATEGORIZER:
+                    return {}
+                elif prompt_type == PromptType.ARTIFACT_ANALYZER:
+                    return set()
+                elif prompt_type == PromptType.CLUSTER_ANALYZER:
+                    return {}
+                else:
+                    raise ValueError(f"Unsupported prompt type: {prompt_type}")
 
 
     def _process_parallel(self, items: List[Any], prompt_type: PromptType, batch_size: int, config: Optional[ProcessConfig]=None) -> Dict[int, Any]:

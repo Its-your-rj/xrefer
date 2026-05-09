@@ -762,6 +762,11 @@ class GhidraBackend(BackEnd):
             program = self._get_actual_program()
             executable_path = program.getExecutablePath()
             if executable_path:
+                # Ghidra on Windows prefixes paths with a leading slash (e.g. /C:/foo.exe).
+                # Strip it so Python file operations work correctly on Windows.
+                import re
+                if re.match(r'^/[A-Za-z]:/', executable_path):
+                    executable_path = executable_path[1:]
                 return executable_path
             # Fallback to program name
             return program.getName()
